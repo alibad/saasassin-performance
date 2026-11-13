@@ -1,0 +1,198 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Imported employees keep their directory member id; on first verified sign-in
+    // the server writes memberLinks/{authUid} -> memberId. Owners use their uid.
+    function memberLinkPath(organizationId) {
+      return /databases/$(database)/documents/organizations/$(organizationId)/memberLinks/$(request.auth.uid);
+    }
+
+    function myMemberId(organizationId) {
+      return exists(memberLinkPath(organizationId))
+        ? get(memberLinkPath(organizationId)).data.memberId
+        : request.auth.uid;
+    }
+
+    function memberPath(organizationId) {
+      return /databases/$(database)/documents/organizations/$(organizationId)/members/$(myMemberId(organizationId));
+    }
+
+    function isActiveMember(organizationId) {
+      return signedIn()
+        && exists(memberPath(organizationId))
+        && get(memberPath(organizationId)).data.status == 'active';
+    }
+
+    function rolePath(organizationId) {
+      return /databases/$(database)/documents/organizations/$(organizationId)/roles/$(get(memberPath(organizationId)).data.roleId);
+    }
+
+    function hasPermission(organizationId, permission) {
+      return isActiveMember(organizationId)
+        && exists(rolePath(organizationId))
+        && get(rolePath(organizationId)).data.permissions.hasAny([permission]);
+    }
+
+    match /users/{userId} {
+      allow read, create, update: if signedIn() && request.auth.uid == userId;
+      allow delete: if false;
+
+      match /memberships/{organizationId} {
+        allow read: if signedIn() && request.auth.uid == userId;
+        allow write: if false;
+      }
+    }
+
+    match /organizations/{organizationId} {
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid;
+      allow read: if hasPermission(organizationId, 'organization.read');
+      allow update: if hasPermission(organizationId, 'organization.manage');
+      allow delete: if false;
+
+      match /members/{memberId} {
+        allow read: if hasPermission(organizationId, 'directory.read');
+        allow create: if hasPermission(organizationId, 'directory.manage')
+          && (
+            request.resource.data.roleId in ['employee', 'manager']
+            || hasPermission(organizationId, 'roles.manage')
+          );
+        allow update: if hasPermission(organizationId, 'directory.manage')
+          && (
+            request.resource.data.roleId == resource.data.roleId
+            || hasPermission(organizationId, 'roles.manage')
+          );
+        allow delete: if hasPermission(organizationId, 'directory.manage')
+          && memberId != myMemberId(organizationId);
+      }
+
+      match /teams/{teamId} {
+        allow read: if hasPermission(organizationId, 'directory.read');
+        allow create, update, delete: if hasPermission(organizationId, 'directory.manage');
+      }
+
+      match /roles/{roleId} {
+        allow read: if hasPermission(organizationId, 'roles.read');
+        allow create: if hasPermission(organizationId, 'roles.manage')
+          && request.resource.data.builtIn == false;
+        allow update, delete: if hasPermission(organizationId, 'roles.manage')
+          && resource.data.builtIn == false;
+      }
+
+      match /reviewTemplates/{templateId} {
+        allow read: if hasPermission(organizationId, 'reviews.read')
+          || hasPermission(organizationId, 'reviews.manage');
+        allow create, update, delete: if hasPermission(organizationId, 'reviews.manage');
+      }
+
+      match /reviewCycles/{cycleId} {
+        allow read: if hasPermission(organizationId, 'reviews.read')
+          || hasPermission(organizationId, 'reviews.manage');
+        allow create, update, delete: if hasPermission(organizationId, 'reviews.manage');
+
+        match /reviews/{reviewId} {
+          allow read: if hasPermission(organizationId, 'reviews.read_all')
+            || (
+              hasPermission(organizationId, 'reviews.read')
+              && resource.data.reviewerId == myMemberId(organizationId)
+            );
+          allow create, delete: if hasPermission(organizationId, 'reviews.manage');
+          allow update: if hasPermission(organizationId, 'reviews.manage')
+            || (
+              hasPermission(organizationId, 'reviews.submit')
+              && resource.data.reviewerId == myMemberId(organizationId)
+              && get(/databases/$(database)/documents/organizations/$(organizationId)/reviewCycles/$(cycleId)).data.state == 'review_writing'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'answers', 'state', 'updatedAt', 'submittedAt'
+              ])
+              && request.resource.data.state in ['draft', 'submitted']
+              && (resource.data.state != 'submitted' || request.resource.data.state == 'submitted')
+            );
+        }
+
+        // Program records below are written only by the server (Admin SDK) after
+        // relationship-aware authorization. Clients get narrow, read-only access.
+        match /nominations/{nominationId} {
+          allow read: if hasPermission(organizationId, 'reviews.manage')
+            || (
+              isActiveMember(organizationId)
+              && (resource.data.subjectId == myMemberId(organizationId) || resource.data.peerId == myMemberId(organizationId))
+            );
+          allow write: if false;
+        }
+
+        match /calibrations/{subjectId} {
+          allow read: if hasPermission(organizationId, 'reviews.calibrate');
+          allow write: if false;
+        }
+
+        match /packets/{subjectId} {
+          allow read: if hasPermission(organizationId, 'reviews.calibrate')
+            || (
+              isActiveMember(organizationId)
+              && subjectId == myMemberId(organizationId)
+              && resource.data.state != 'withdrawn'
+            );
+          allow write: if false;
+        }
+      }
+
+      match /memberLinks/{authUid} {
+        allow read: if signedIn() && request.auth.uid == authUid;
+        allow write: if false;
+      }
+
+      match /goals/{goalId} {
+        allow read: if isActiveMember(organizationId)
+          && (
+            resource.data.visibility == 'public'
+            || resource.data.ownerId == myMemberId(organizationId)
+            || hasPermission(organizationId, 'reviews.read_all')
+          );
+        allow write: if false;
+      }
+
+      match /feedback/{feedbackId} {
+        allow read: if isActiveMember(organizationId)
+          && (
+            resource.data.authorId == myMemberId(organizationId)
+            || resource.data.recipientId == myMemberId(organizationId)
+          );
+        allow write: if false;
+      }
+
+      match /oneOnOnes/{meetingId} {
+        allow read: if isActiveMember(organizationId)
+          && myMemberId(organizationId) in resource.data.participantIds;
+        allow write: if false;
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if isActiveMember(organizationId)
+          && resource.data.recipientId == myMemberId(organizationId);
+        allow write: if false;
+      }
+
+      match /auditEvents/{eventId} {
+        allow read: if hasPermission(organizationId, 'audit.read');
+        allow create: if hasPermission(organizationId, 'audit.write')
+          && request.resource.data.actorId == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+
+      match /{document=**} {
+        allow read, write: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
